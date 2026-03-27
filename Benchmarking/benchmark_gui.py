@@ -15,6 +15,7 @@ import os
 import threading
 import time as _time
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -70,6 +71,7 @@ class BenchmarkApp(tk.Tk):
         self.pairs_var: list = []          # list of (path_a, path_b, label)
         self.results:   list = []          # accumulated result dicts
         self.mesh_cache: dict = {}         # path -> (V, F, S)
+        self._cell_cache: dict = {}        # (desc, path_a, path_b) -> cell list
         self._iid_to_result: dict = {}     # treeview iid -> result dict
         self._selected_result = None
 
@@ -211,6 +213,11 @@ class BenchmarkApp(tk.Tk):
             activebackground="#79c0ff", activeforeground=DARK["bg"])
         self.run_btn.pack(side=tk.LEFT, padx=2)
 
+        self._btn(rf, "💾  Save", self._save_session,
+                  fg=DARK["accent2"]).pack(side=tk.LEFT, padx=2)
+        self._btn(rf, "📂  Load", self._load_session,
+                  fg=DARK["accent3"]).pack(side=tk.LEFT, padx=2)
+
         self.status_lbl = tk.Label(rf, text="", bg=DARK["bg"],
                                    fg=DARK["subtext"], font=("monospace", 9))
         self.status_lbl.pack(side=tk.LEFT, padx=8)
@@ -342,6 +349,8 @@ class BenchmarkApp(tk.Tk):
 
     def _benchmark_worker(self, pairs, desc_keys):
         done = 0
+        done_lock = threading.Lock()
+
         for path_a, path_b, label in pairs:
             self._set_status(f"Loading  {os.path.basename(path_a)} ...")
             try:
@@ -353,57 +362,89 @@ class BenchmarkApp(tk.Tk):
                 vb, fb, sb = self.mesh_cache[path_b]
             except Exception as e:
                 self._set_status(f"ERROR loading: {e}")
+                with done_lock:
+                    done += len(desc_keys)
+                self.after(0, self._set_progress, done)
                 continue
 
-            for key in desc_keys:
-                self._set_status(f"{key}  ·  {os.path.basename(path_a)[:22]}")
+            def _run_one_desc(key, _va=va, _fa=fa, _sa=sa,
+                              _vb=vb, _fb=fb, _sb=sb,
+                              _label=label, _pa=path_a, _pb=path_b):
                 desc = DESCRIPTOR_REGISTRY[key]
                 try:
                     t0 = _time.perf_counter()
-                    d_a = desc.compute(va, fa, sa)
+                    d_a = desc.compute(_va, _fa, _sa)
                     t1 = _time.perf_counter()
-                    d_b = desc.compute(vb, fb, sb)
+                    d_b = desc.compute(_vb, _fb, _sb)
                     t2 = _time.perf_counter()
-
                     scores = {}
                     for m, fn in METRIC_REGISTRY.items():
                         try:
                             scores[m] = fn(d_a, d_b)
                         except Exception:
                             scores[m] = float("nan")
-
-                    result = {
-                        "pair_label": label,
-                        "path_a": path_a,
-                        "path_b": path_b,
-                        "descriptor": key,
-                        "d_a": d_a,
-                        "d_b": d_b,
+                    return {
+                        "pair_label": _label, "path_a": _pa, "path_b": _pb,
+                        "descriptor": key, "d_a": d_a, "d_b": d_b,
                         "scores": scores,
                         "ta_ms": (t1 - t0) * 1000,
                         "tb_ms": (t2 - t1) * 1000,
                     }
-                    self.results.append(result)
-                    self.after(0, self._add_table_row, result)
-
                 except Exception as e:
-                    err_result = {
-                        "pair_label": label,
-                        "path_a": path_a,
-                        "path_b": path_b,
+                    return {
+                        "pair_label": _label, "path_a": _pa, "path_b": _pb,
                         "descriptor": key,
-                        "d_a": np.array([]),
-                        "d_b": np.array([]),
+                        "d_a": np.array([]), "d_b": np.array([]),
                         "scores": {m: float("nan") for m in METRIC_REGISTRY},
-                        "ta_ms": 0.0,
-                        "tb_ms": 0.0,
+                        "ta_ms": 0.0, "tb_ms": 0.0,
                         "error": str(e),
                     }
-                    self.results.append(err_result)
-                    self.after(0, self._add_table_row, err_result)
 
-                done += 1
-                self.after(0, self._set_progress, done)
+            n_workers = min(len(desc_keys), os.cpu_count() or 4)
+            self._set_status(
+                f"Running {len(desc_keys)} descriptors "
+                f"({n_workers} threads)  ·  {os.path.basename(path_a)[:22]}")
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_run_one_desc, k): k for k in desc_keys}
+                for future in as_completed(futures):
+                    result = future.result()
+                    self.results.append(result)
+                    self.after(0, self._add_table_row, result)
+                    with done_lock:
+                        done += 1
+                    self.after(0, self._set_progress, done)
+
+        # Pre-compute cell correspondences so Save always includes them.
+        # Cells are stored without display offset — offset is applied at render time.
+        successful = [r for r in self.results if not r.get("error")]
+        if successful:
+            n_cell = len(successful)
+            self.after(0, lambda: self.progress.config(maximum=n_cell, value=0))
+            cell_done = [0]
+            cell_lock = threading.Lock()
+
+            def _pre_cell(r):
+                key = (r["descriptor"], r["path_a"], r["path_b"])
+                if key not in self._cell_cache:
+                    try:
+                        va_, fa_, sa_ = self.mesh_cache[r["path_a"]]
+                        vb_, fb_, sb_ = self.mesh_cache[r["path_b"]]
+                        self._cell_cache[key] = _compute_cell_correspondences(
+                            r["descriptor"], va_, fa_, sa_, vb_, fb_, sb_)
+                    except Exception:
+                        pass
+                with cell_lock:
+                    cell_done[0] += 1
+                    n = cell_done[0]
+                self._set_status(
+                    f"Correspondence lines  {n}/{n_cell}  "
+                    f"({r['descriptor']} · {os.path.basename(r['path_a'])[:18]})")
+                self.after(0, self._set_progress, n)
+
+            n_workers = min(n_cell, os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                list(pool.map(_pre_cell, successful))
 
         self.after(0, self._benchmark_done)
 
@@ -416,6 +457,72 @@ class BenchmarkApp(tk.Tk):
     def _benchmark_done(self):
         self.run_btn.config(state=tk.NORMAL)
         self.status_lbl.config(text=f"Done — {len(self.results)} results")
+
+    # ─── session save / load ──────────────────────────────────────────────────
+
+    def _save_session(self):
+        import pickle
+        if not self.results:
+            messagebox.showinfo("Nothing to save", "Run the benchmark first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Session",
+            defaultextension=".pkl",
+            filetypes=[("Benchmark session", "*.pkl"), ("All", "*.*")])
+        if not path:
+            return
+        session = {
+            "version": 1,
+            "results":    self.results,
+            "cell_cache": self._cell_cache,
+            "pairs_var":  self.pairs_var,
+        }
+        try:
+            with open(path, "wb") as fh:
+                pickle.dump(session, fh, protocol=4)
+            self.status_lbl.config(
+                text=f"Saved {len(self.results)} results → {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _load_session(self):
+        import pickle
+        path = filedialog.askopenfilename(
+            title="Load Session",
+            filetypes=[("Benchmark session", "*.pkl"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                session = pickle.load(fh)
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+
+        if session.get("version", 0) != 1:
+            messagebox.showwarning("Unknown format",
+                                   "Session file version not recognised — trying anyway.")
+
+        self.results = session.get("results", [])
+        self._cell_cache.update(session.get("cell_cache", {}))
+
+        # Restore pairs listbox (skip duplicates)
+        existing = {(pa, pb) for pa, pb, _ in self.pairs_var}
+        for pa, pb, lbl in session.get("pairs_var", []):
+            if (pa, pb) not in existing:
+                self.pairs_var.append((pa, pb, lbl))
+                self.pairs_lb.insert(tk.END, f"  {lbl}")
+                existing.add((pa, pb))
+
+        # Repopulate results table
+        self._clear_table()
+        for r in self.results:
+            self._add_table_row(r)
+
+        n_cells = len(self._cell_cache)
+        self.status_lbl.config(
+            text=f"Loaded {len(self.results)} results, "
+                 f"{n_cells} cached correspondence sets — {os.path.basename(path)}")
 
     # ─── table management ────────────────────────────────────────────────────
 
@@ -589,7 +696,7 @@ class BenchmarkApp(tk.Tk):
         if not valid:
             messagebox.showinfo("No results", "Run the benchmark first.")
             return
-        MeshViewerWindow(self, valid, self.mesh_cache)
+        MeshViewerWindow(self, valid, self.mesh_cache, self._cell_cache)
 
     def _draw_placeholder(self):
         self.fig.clear()
@@ -693,18 +800,17 @@ def _desc_face_colors(desc_name, vertices, faces, semantics):
         return [cmap(norm(v)) for v in r]
 
 
-def _compute_cell_correspondences(desc_name, va, fa, sa, vb_off, fb, sb,
-                                   n_rings=4, n_sectors=6, min_faces=8):
+def _compute_cell_correspondences(desc_name, va, fa, sa, vb, fb, sb,
+                                   n_rings=4, n_sectors=6, min_faces=8,
+                                   on_progress=None):
     """
     Universal spatial correspondences for ANY descriptor.
 
     Divides both meshes into a polar grid, computes the descriptor on each
     cell's local faces, and matches cells by cosine similarity.
 
-    For NDS / ScanContextMesh the fast path extracts sub-vectors from the
-    already-computed global descriptors.  For all other descriptors the
-    descriptor is recomputed locally per cell, giving meaningful spatial
-    matches regardless of descriptor type.
+    on_progress(done, total) is called (from worker threads) after each cell
+    completes — use it to drive a progress bar.
     """
     from descriptors import compute_face_centroids
 
@@ -720,29 +826,42 @@ def _compute_cell_correspondences(desc_name, va, fa, sa, vb_off, fb, sb,
         return ri, si, cents
 
     ri_a, si_a, cents_a = polar_assign(va, fa)
-    ri_b, si_b, cents_b = polar_assign(vb_off, fb)  # centering removes the X offset
+    ri_b, si_b, cents_b = polar_assign(vb, fb)
 
     desc = DESCRIPTOR_REGISTRY[desc_name]
-    cells = []
+    cell_args = [(ri, si) for ri in range(n_rings) for si in range(n_sectors)]
+    total = len(cell_args)
+    done_count = [0]
+    done_lock  = threading.Lock()
 
-    for ri in range(n_rings):
-        for si in range(n_sectors):
-            ma = (ri_a == ri) & (si_a == si)
-            mb = (ri_b == ri) & (si_b == si)
-            if ma.sum() < min_faces or mb.sum() < min_faces:
-                continue
+    def _cell_sim(ri, si):
+        ma = (ri_a == ri) & (si_a == si)
+        mb = (ri_b == ri) & (si_b == si)
+        result = None
+        if ma.sum() >= min_faces and mb.sum() >= min_faces:
             ca = cents_a[ma].mean(axis=0)
             cb = cents_b[mb].mean(axis=0)
             try:
-                d_a = desc.compute(va,     fa[ma], sa[ma])
-                d_b = desc.compute(vb_off, fb[mb], sb[mb])
+                d_a = desc.compute(va, fa[ma], sa[ma])
+                d_b = desc.compute(vb, fb[mb], sb[mb])
                 na, nb = np.linalg.norm(d_a), np.linalg.norm(d_b)
                 sim = float(np.dot(d_a, d_b) / (na * nb)) if na > 1e-10 and nb > 1e-10 else 0.0
             except Exception:
                 sim = 0.0
-            cells.append((ca, cb, max(0.0, sim)))
+            result = (ca, cb, max(0.0, sim))
+        if on_progress is not None:
+            with done_lock:
+                done_count[0] += 1
+                n = done_count[0]
+            on_progress(n, total)
+        return result
 
-    return cells
+    n_workers = min(total, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [pool.submit(_cell_sim, ri, si) for ri, si in cell_args]
+        raw = [f.result() for f in futures]
+
+    return [c for c in raw if c is not None]
 
 
 _COLOR_DESC = {
@@ -918,7 +1037,7 @@ def _o3d_highlight_geoms(cells_sorted, sel_idx, mesh_scale, max_lines=50):
 class MeshViewerWindow(tk.Toplevel):
     """3D viewer: GPU-accelerated via Open3D (if installed), else matplotlib fallback."""
 
-    def __init__(self, parent, results, mesh_cache):
+    def __init__(self, parent, results, mesh_cache, cell_cache):
         super().__init__(parent)
         self.title("3D Match Viewer" + ("  [Open3D]" if HAS_O3D else "  [matplotlib]"))
         self.geometry("1400x820")
@@ -928,14 +1047,16 @@ class MeshViewerWindow(tk.Toplevel):
         self.valid = results
         self.mesh_cache = mesh_cache
         self._color_cache: dict = {}
-        self._cell_cache:  dict = {}
+        self._cell_cache  = cell_cache   # shared with BenchmarkApp — survives viewer re-opens
 
         # O3D interactivity state
-        self._o3d_queue:        _queue.Queue = _queue.Queue(maxsize=1)
-        self._o3d_mesh_geoms:   list         = []   # [mesh_a, mesh_b]
-        self._cells_sorted:     list         = []
-        self._mesh_scale:       float        = 1.0
-        self._sel_idx:          int          = -1   # -1 = all lines shown
+        self._o3d_queue:           _queue.Queue = _queue.Queue(maxsize=1)
+        self._o3d_mesh_geoms:      list         = []   # [mesh_a, mesh_b]
+        self._o3d_mesh_geom_cache: dict         = {}   # (desc,path_a,path_b,side) -> TriangleMesh
+        self._o3d_running:         bool         = False
+        self._cells_sorted:        list         = []
+        self._mesh_scale:          float        = 1.0
+        self._sel_idx:             int          = -1   # -1 = all lines shown
 
         # Matplotlib pick state
         self._line_artists: list = []
@@ -1046,12 +1167,13 @@ class MeshViewerWindow(tk.Toplevel):
         vb, fb, sb = self.mesh_cache[r["path_b"]]
         desc_name  = r["descriptor"]
 
-        key_a = (desc_name, r["path_a"])
-        key_b = (desc_name, r["path_b"])
-        if key_a not in self._color_cache:
-            self._color_cache[key_a] = _desc_face_colors(desc_name, va, fa, sa)
-        if key_b not in self._color_cache:
-            self._color_cache[key_b] = _desc_face_colors(desc_name, vb, fb, sb)
+        # ── face colours (cached) ─────────────────────────────────────────
+        col_key_a = (desc_name, r["path_a"])
+        col_key_b = (desc_name, r["path_b"])
+        if col_key_a not in self._color_cache:
+            self._color_cache[col_key_a] = _desc_face_colors(desc_name, va, fa, sa)
+        if col_key_b not in self._color_cache:
+            self._color_cache[col_key_b] = _desc_face_colors(desc_name, vb, fb, sb)
 
         xa_range = va[:, 0].max() - va[:, 0].min()
         xb_range = vb[:, 0].max() - vb[:, 0].min()
@@ -1061,15 +1183,26 @@ class MeshViewerWindow(tk.Toplevel):
         self._mesh_scale = float(np.linalg.norm(
             np.array([va[:, i].max() - va[:, i].min() for i in range(3)])))
 
-        mesh_a = _o3d_colored_mesh(va,     fa, self._color_cache[key_a])
-        mesh_b = _o3d_colored_mesh(vb_off, fb, self._color_cache[key_b])
-        self._o3d_mesh_geoms = [mesh_a, mesh_b]
+        # ── TriangleMesh objects (cached — avoids vertex duplication + normal
+        #    computation on every descriptor switch) ─────────────────────────
+        geom_key_a = (desc_name, r["path_a"])
+        geom_key_b = (desc_name, r["path_a"], r["path_b"])   # includes path_a because offset depends on va
+        if geom_key_a not in self._o3d_mesh_geom_cache:
+            self._o3d_mesh_geom_cache[geom_key_a] = _o3d_colored_mesh(
+                va, fa, self._color_cache[col_key_a])
+        if geom_key_b not in self._o3d_mesh_geom_cache:
+            self._o3d_mesh_geom_cache[geom_key_b] = _o3d_colored_mesh(
+                vb_off, fb, self._color_cache[col_key_b])
+        mesh_a = self._o3d_mesh_geom_cache[geom_key_a]
+        mesh_b = self._o3d_mesh_geom_cache[geom_key_b]
 
-        cells = self._get_cells(r, va, fa, sa, vb_off, fb, sb, desc_name)
+        # ── correspondence lines ──────────────────────────────────────────
+        cells_raw = self._get_cells(r, va, fa, sa, vb, fb, sb, desc_name)
+        cells = [(ca, cb + offset, sim) for ca, cb, sim in cells_raw]
         self._cells_sorted = sorted(cells, key=lambda c: c[2], reverse=True)
         self._sel_idx = -1
 
-        # Populate listbox
+        # ── populate sidebar listbox ──────────────────────────────────────
         self.line_lb.delete(0, tk.END)
         import matplotlib.cm as cm
         cmap = cm.get_cmap("RdYlGn")
@@ -1085,46 +1218,55 @@ class MeshViewerWindow(tk.Toplevel):
                  + "  ".join(f"{m}={v:.3f}" for m, v in r["scores"].items()
                               if not np.isnan(v)))
 
-        # Drain stale queue item
-        try:
-            self._o3d_queue.get_nowait()
-        except _queue.Empty:
-            pass
+        init_ls    = _o3d_lineset(self._cells_sorted)
+        line_geoms = [init_ls] if init_ls else []
 
-        # Launch Visualizer with animation callback that reads from the queue
-        q            = self._o3d_queue
-        mesh_geoms   = self._o3d_mesh_geoms
-        cells_sorted = self._cells_sorted
-        mesh_scale   = self._mesh_scale
+        if self._o3d_running:
+            # ── window already open: push scene update, no new thread ─────
+            self._push_o3d({"meshes": [mesh_a, mesh_b], "lines": line_geoms})
+        else:
+            # ── first open: launch the Visualizer in a background thread ──
+            q = self._o3d_queue
+            # Drain any stale item
+            try:
+                q.get_nowait()
+            except _queue.Empty:
+                pass
 
-        def run():
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(window_name=title, width=1280, height=800)
-            for g in mesh_geoms:
-                vis.add_geometry(g)
-            init_ls = _o3d_lineset(cells_sorted)
-            if init_ls:
-                vis.add_geometry(init_ls)
-            current = [init_ls]   # mutable ref to current line geometry list
+            def run(_ma=mesh_a, _mb=mesh_b, _ll=line_geoms):
+                vis = o3d.visualization.Visualizer()
+                vis.create_window(window_name=title, width=1280, height=800)
+                state = {"meshes": [_ma, _mb], "lines": list(_ll)}
+                for g in state["meshes"] + state["lines"]:
+                    vis.add_geometry(g)
 
-            def on_frame(v):
-                try:
-                    new_geoms = q.get_nowait()
-                except _queue.Empty:
+                def on_frame(v):
+                    try:
+                        update = q.get_nowait()
+                    except _queue.Empty:
+                        return False
+                    if "meshes" in update:
+                        for g in state["meshes"]:
+                            v.remove_geometry(g, reset_bounding_box=False)
+                        for g in update["meshes"]:
+                            v.add_geometry(g, reset_bounding_box=False)
+                        state["meshes"] = update["meshes"]
+                    if "lines" in update:
+                        for g in state["lines"]:
+                            v.remove_geometry(g, reset_bounding_box=False)
+                        for g in update["lines"]:
+                            v.add_geometry(g, reset_bounding_box=False)
+                        state["lines"] = update["lines"]
+                    v.update_renderer()
                     return False
-                for g in current[0] if isinstance(current[0], list) else ([current[0]] if current[0] else []):
-                    v.remove_geometry(g, reset_bounding_box=False)
-                for g in new_geoms:
-                    v.add_geometry(g, reset_bounding_box=False)
-                current[0] = new_geoms
-                v.update_renderer()
-                return False
 
-            vis.register_animation_callback(on_frame)
-            vis.run()
-            vis.destroy_window()
+                vis.register_animation_callback(on_frame)
+                self._o3d_running = True
+                vis.run()
+                self._o3d_running = False
+                vis.destroy_window()
 
-        threading.Thread(target=run, daemon=True).start()
+            threading.Thread(target=run, daemon=True).start()
 
         n = len(self._cells_sorted)
         self.info_lbl.config(
@@ -1143,7 +1285,7 @@ class MeshViewerWindow(tk.Toplevel):
         self._sel_idx = idx
         geoms = _o3d_highlight_geoms(
             self._cells_sorted, idx, self._mesh_scale)
-        self._push_o3d(geoms)
+        self._push_o3d({"lines": geoms})
         ca, cb, sim = self._cells_sorted[idx]
         self.info_lbl.config(
             text=f"Line #{idx+1}  sim={sim:.4f}  —  "
@@ -1154,7 +1296,7 @@ class MeshViewerWindow(tk.Toplevel):
         self.line_lb.selection_clear(0, tk.END)
         geoms = _o3d_highlight_geoms(
             self._cells_sorted, -1, self._mesh_scale)
-        self._push_o3d(geoms)
+        self._push_o3d({"lines": geoms})
         self.info_lbl.config(text="All correspondence lines shown")
 
     def _push_o3d(self, geoms):
@@ -1220,7 +1362,8 @@ class MeshViewerWindow(tk.Toplevel):
                     lbl, color=col, fontsize=9, ha="center",
                     fontfamily="monospace", fontweight="bold")
 
-        cells = self._get_cells(r, va, fa, sa, vb_off, fb, sb, desc_name)
+        cells_raw = self._get_cells(r, va, fa, sa, vb, fb, sb, desc_name)
+        cells = [(ca, cb + offset, sim) for ca, cb, sim in cells_raw]
         self._cells_sorted = sorted(cells, key=lambda c: c[2], reverse=True)
         self._mpl_sel_idx  = -1
 
@@ -1314,14 +1457,24 @@ class MeshViewerWindow(tk.Toplevel):
 
     # ── shared helpers ────────────────────────────────────────────────────────
 
-    def _get_cells(self, r, va, fa, sa, vb_off, fb, sb, desc_name):
-        """Cell correspondences, cached per (desc, pair)."""
+    def _get_cells(self, r, va, fa, sa, vb, fb, sb, desc_name):
+        """
+        Cell correspondences, cached per (desc, pair).
+        Cells are stored WITHOUT display offset — callers add offset to cb at render time.
+        """
         key = (desc_name, r["path_a"], r["path_b"])
         if key not in self._cell_cache:
-            self.info_lbl.config(text="Computing cell correspondences …")
+            n_total = 4 * 6   # n_rings × n_sectors
+
+            def _progress(done, total):
+                self.after(0, self.info_lbl.config,
+                           {"text": f"Computing correspondence lines …  {done}/{total} cells"})
+
+            self.info_lbl.config(
+                text=f"Computing correspondence lines …  0/{n_total} cells")
             self.update()
             self._cell_cache[key] = _compute_cell_correspondences(
-                desc_name, va, fa, sa, vb_off, fb, sb)
+                desc_name, va, fa, sa, vb, fb, sb, on_progress=_progress)
         return self._cell_cache[key]
 
     def _refresh(self):
